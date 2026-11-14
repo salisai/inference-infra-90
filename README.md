@@ -236,4 +236,17 @@ cudaFree(A_d); cudaFree(B_d); cudaFree(C_d); //free GPU space
 - `blocks = (n + threads - 1) / threads`: n divided by threads, rounded up.
 - `cudaFree`: gives the GPU memory back.
 
-Today we covered the fundamental model of CUDA, how threads, blocks, grid, warp works. Tomorrow we will move toward naive version of matrix multiplication and more indepth of 2d grids. 
+Today we covered the fundamental model of CUDA, how threads, blocks, grid, warp work. Tomorrow we will move toward naive version of matrix multiplication and more indepth of 2d grids. 
+
+
+## Day 3: Matrix Multiplication 
+A 2D matrix is stored as a 1D array. C, C++ and CUDA use row-major order: the elements of row 0 first, then row 1, and so on. Opposite to this we have column-major order, first the first column, then second and so on. Fortran, MATLAB, R, Pandas, OpenGL use column-by-column in contiguous memory. 
+
+
+![Row Major Order](./assets/day3/row-major.png)
+
+For 3D: we have `index = plane * (Width * Height) + row * Width + col`
+
+Now we will come towards matmul. In matmul we get one element in the output matrix from the dot product of one matrix row and second matrix column. For example: 
+
+![Row Major Order](./assets/day3/matmul.png)
