@@ -250,3 +250,53 @@ For 3D: we have `index = plane * (Width * Height) + row * Width + col`
 Now we will come towards matmul. In matmul we get one element in the output matrix from the dot product of one matrix row and second matrix column. For example: 
 
 ![Row Major Order](./assets/day3/matmul.png)
+
+### Naive matmul kernel 
+```cpp
+// M, N are the input matrices and P is the output
+__global__ void MatrixMulKernel(const float* M, const float* N, float* P, int Width){
+    int row = blockIdx.y * blockDim.y + threadIdx.y; 
+    int col = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (row < Width && col < Width){ //boundary check for square matrix
+        float Pvalue = 0.0f; 
+        for (int k = 0; k < Width; ++k){
+            Pvalue += M[row * Width + k] * N[k * Width + col];
+        }
+
+        P[row * Width + col] = Pvalue; //one write
+    }
+}
+```
+
+- `row * Width`: jumps to the start of the row, and `+k` steps right inside that row as k grows. 
+- If you look, the movement is different in second matrix. `col` selects the column and `k + Width` jumps down one whole row per step of k. 
+
+
+
+### Global memory reads and writes (naive kernel)
+
+W = Width (matrices are W x W). Counts are in elements (1 float = 4 bytes).
+
+| | Per thread (one output) | Whole kernel |
+|---|---:|---:|
+| Reads from M | W | W x W x W = W³ |
+| Reads from N | W | W³ |
+| **Total reads** | **2W** | **2 x W³** |
+| **Writes to P** | **1** | **W²** |
+| FLOPs | 2W | 2 x W³ |
+
+Example with W = 4: 16 threads x 8 reads = **128 reads**, **16 writes**.
+
+### Bigger sizes
+
+| W | Global reads | Reads in bytes | Writes | Minimum possible reads (each element once) |
+|---:|---:|---:|---:|---:|
+| 4 | 128 | 512 B | 16 | 32 |
+| 1024 | 2,147,483,648 | 8.6 GB | 1,048,576 | 2,097,152 |
+| 2048 | 17,179,869,184 | 68.7 GB | 4,194,304 | 8,388,608 |
+
+Every element of M and N is read W times, once for each output that needs it. This repeated reading is the waste, which tiling solved(coming topic). 
+
+- Arithmatic intensity (no cache): 2W^3 FLOPs/(2W^3 x 4 bytes) = 0.25 FLOP per byte. 
+- The H100 needs about 300 FLOPs per byte to be compute-bound. The naive kernel is far on the memory-bound side. 
