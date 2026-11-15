@@ -288,6 +288,8 @@ W = Width (matrices are W x W). Counts are in elements (1 float = 4 bytes).
 
 Example with W = 4: 16 threads x 8 reads = **128 reads**, **16 writes**.
 
+<br/>
+
 ### Bigger sizes
 
 | W | Global reads | Reads in bytes | Writes | Minimum possible reads (each element once) |
@@ -296,7 +298,55 @@ Example with W = 4: 16 threads x 8 reads = **128 reads**, **16 writes**.
 | 1024 | 2,147,483,648 | 8.6 GB | 1,048,576 | 2,097,152 |
 | 2048 | 17,179,869,184 | 68.7 GB | 4,194,304 | 8,388,608 |
 
+<br/>
 Every element of M and N is read W times, once for each output that needs it. This repeated reading is the waste, which tiling solved(coming topic). 
 
-- Arithmatic intensity (no cache): 2W^3 FLOPs/(2W^3 x 4 bytes) = 0.25 FLOP per byte. 
+- Arithmatic intensity (no cache): 2W³ FLOPs/(2W³ x 4 bytes) = 0.25 FLOP per byte. 
 - The H100 needs about 300 FLOPs per byte to be compute-bound. The naive kernel is far on the memory-bound side. 
+
+
+## Day 4: Memory access: Coalescing and Bandwidth 
+The goal for today is to see with measurements that the way threads touch memory can change speed by 4x to 8x. We use simple copy kernels.
+
+- Global memory is DRAM(HBM or GDDR). Reading one cell is slow. To compensate, DRAM returns a burst: a block of consecutive bytes for each access. Bytes of the burst that you use are cheap. Bytes you don't use are wasted. 
+
+- The GPU caches work the same way. Data moves in cache lines of 128 bytes and each line has four 32-byte sectors. A memory transaction fetche whole sectors. 
+
+- So the speed depends on how many sectors a warp must fetch, not on how many bytes it needs. 
+
+![Efficient Memory Fetching](./assets/day4/sectors.png)
+
+
+### Coalescing
+
+A warp has 32 threads, and they all load at the same moment. The hardware checks which sectors these 32 loads need.
+
+- **Coalesced:** the 32 threads read 32 neighbouring floats. They need 128 bytes in total, which is 4 sectors. All the fetched data is used.
+
+- **Not coalesced:** the threads read floats that are far apart. Each thread needs a different sector. For example, the GPU fetches 32 sectors (1024 bytes) to use 128 bytes(useful bytes/fetched bytes = 128/1024 = 12.5%). **The other 87.5% of the fetched data is wasted.** 
+
+Fewer sectors per warp = faster load.
+
+### How the stride changes it
+
+Stride = how many floats apart neighbouring threads read. Thread t reads element `t * stride`.
+
+| Stride | Sectors fetched per warp | bytes spanned by the warp | Useful data |
+|---:|---:|---:| ------:|
+| 1 (best) | 4 | 128 | 128/ 128 = 100% |
+| 2 | 8 | 256 | 128/256 = 50% |
+| 4 | 16 | 512 | 128/512 = 25% |
+| 8 or more | 32 | 1024 | 128/1024 = 12.5% |
+
+![Efficient Memory Fetching](./assets/day4/coalescing.png)
+
+
+From stride 8, every thread already uses its own sector (32 threads = 32 sectors). So it cannot get worse than 12.5%.
+
+- If the 32 floats start in the middle of a sector, the warp touches 5 sectors instead of 4. This is 80%(128/160) useful. The effect is small on modern GPUs, because the cache keeps the neighbouring sector for the next warp.
+
+
+- Writes follow the same rule. A store that changes only part of a sector can be even worse than a load. With ECC on, the GPU must read the sector, change it, and write it back.
+
+
+- The rule is to make `threadIdx.x` move along the contiguous index, so that neighbouring threads access neighbouring floats.
