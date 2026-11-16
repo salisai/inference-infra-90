@@ -305,7 +305,7 @@ Every element of M and N is read W times, once for each output that needs it. Th
 - The H100 needs about 300 FLOPs per byte to be compute-bound. The naive kernel is far on the memory-bound side. 
 
 
-## Day 4: Memory access: Coalescing and Bandwidth 
+## Day 4: Memory access: Coalescing 
 The goal for today is to see with measurements that the way threads touch memory can change speed by 4x to 8x. We use simple copy kernels.
 
 - Global memory is DRAM(HBM or GDDR). Reading one cell is slow. To compensate, DRAM returns a burst: a block of consecutive bytes for each access. Bytes of the burst that you use are cheap. Bytes you don't use are wasted. 
@@ -315,6 +315,14 @@ The goal for today is to see with measurements that the way threads touch memory
 - So the speed depends on how many sectors a warp must fetch, not on how many bytes it needs. 
 
 ![Efficient Memory Fetching](./assets/day4/sectors.png)
+
+There are three types of global memory access: 
+
+1. **Contiguous access(Coalesced)**: consecutive threads access consecutive memory locations. The GPU combines these reqeusts into fewer memory transactions. 
+
+2. **Stried Access(Uncoalesced)**: consecutive threads access memory locations separated by a fixed distance(stride). This requires more memory transactions and wastes bandwidth. 
+
+3. **Random access(scattered):** threads access unrelated memory locaitons with no predictable pattern. The GPU may need separate memory transactions for each access, resulting in poort memory efficieny. 
 
 
 ### Coalescing
@@ -343,10 +351,34 @@ Stride = how many floats apart neighbouring threads read. Thread t reads element
 
 From stride 8, every thread already uses its own sector (32 threads = 32 sectors). So it cannot get worse than 12.5%.
 
-- If the 32 floats start in the middle of a sector, the warp touches 5 sectors instead of 4. This is 80%(128/160) useful. The effect is small on modern GPUs, because the cache keeps the neighbouring sector for the next warp.
+<br/>
+
+If the 32 floats start in the middle of a sector, the warp touches 5 sectors instead of 4. This is 80%(128/160) useful. The effect is small on modern GPUs, because the cache keeps the neighbouring sector for the next warp.
+
+![Misaligned access](./assets/day4/misaligned.png)
 
 
-- Writes follow the same rule. A store that changes only part of a sector can be even worse than a load. With ECC on, the GPU must read the sector, change it, and write it back.
+Writes follow the same rule. A store that changes only part of a sector can be even worse than a load. With ECC on, the GPU must read the sector, change it, and write it back.
 
 
-- The rule is to make `threadIdx.x` move along the contiguous index, so that neighbouring threads access neighbouring floats.
+The rule is to make `threadIdx.x` move along the contiguous index, so that neighbouring threads access neighbouring floats.
+
+
+### How to Get Coalesced Memory Access 
+The rule is to map consecutive threads to consecutive memory locations. 
+
+- The threads of a warp have consecutive `threadIdx.x`. So `threadIdx.x` must move along the contiguous index of the array. 
+
+- Row-major matrix: element (row, col) is at `row * Width + col`. The column is contiguous so col must come from threadIdx.x. Moving across columns increases the memory index by one. 
+
+- `N[k * Width + col]` is coalesced. `M[row * Width + k]` has the same address for all threads of a warp. (one value from the M is broadcasted). 
+
+- If threads walk down a column (`A[col * Width + row]`), their addresses are `Width` apart. Uncoalesced. 
+
+- Use structure of arrays (one array per field) instead of array of structures when each thread reads the same field of different items. 
+
+### Shared Memory 
+Shared memory has 32 banks, each 4 bytes wide. Word number i is in bank i % 32. If the 32 threads of a warp use 32 different banks, all are served in one step. If several threads use different addresses in the same bank, that is a bank conflict. The accesses are served serially: one after another. If several threads read the same address, it is a braodcast. No conflict, like in the third point in the previous section. 
+
+Tomorrow we will cover some more memory optimizations. 
+
