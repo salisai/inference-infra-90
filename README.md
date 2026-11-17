@@ -398,7 +398,7 @@ An SM has a finite register file. If too many registers are required by simultan
 - **Active thread blocks per SM** = Min(warp-based-limit, registers-based limit, shared-memory-based-limit)
 
 
-![Grid diagram](./assets/day5/grid.png)
+![Grid diagram](./assets/day5/formula.png)
 
 What happens while the warp waits for data? The SM schedular can select another eligible warp and execute its instructions. This is called latency hiding. 
 
