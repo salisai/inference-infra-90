@@ -382,3 +382,39 @@ Shared memory has 32 banks, each 4 bytes wide. Word number i is in bank i % 32. 
 
 Tomorrow we will cover some more memory optimizations. 
 
+## Day 5: More on GPU Memory  
+### Occupancy
+Registers are very small, extremely fast storage locations physically located inside the SM's execution hardware.
+
+![Grid diagram](./assets/day5/grid.png)
+
+Each thread has its own logical register values. Other threads can't directly access that thread's registers. Registers hold intermediate values, pointers, loop counters and calculations. The compiler decides how many registers a thread needs. 
+
+An SM has a finite register file. If too many registers are required by simultaniously resident threads, fewer threads can reside on that SM. 
+
+- **Active warps per SM** = active thread blocks per SM * active warps per block
+- **Active threads per SM** = active thread blocks per SM * ThreadsPerBlock 
+
+- **Active thread blocks per SM** = Min(warp-based-limit, registers-based limit, shared-memory-based-limit)
+
+
+![Grid diagram](./assets/day5/grid.png)
+
+What happens while the warp waits for data? The SM schedular can select another eligible warp and execute its instructions. This is called latency hiding. 
+
+The purpose of occupancy is to provide enough resident warps to help hide execution latency.
+
+**A kernel with 50% occupancy can outperform a kernel with 100% occupancy if it has better instruction-level parallelism, less redundant work, or better memory behavior.**
+
+### Register 
+Describes the demand placed on the available register resources by a kernel's live values. 
+
+If many values must remain alive at the same time, the compiler needs more registers per thread. That increases register pressure. 
+
+More resources consumed per thread can reduce the number of resident threads and warps.
+
+### Register Spilling 
+Imagine the compiler wants to keep 100 values available for a thread, but the compiler or hardware allocation constraints make it unable to keep all those values in registers.
+
+It may place some values in local memory. This is called register spilling. register spilling can cause additional memory traffic and reduce performance.
+
