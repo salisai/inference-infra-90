@@ -406,7 +406,7 @@ The purpose of occupancy is to provide enough resident warps to help hide execut
 
 **A kernel with 50% occupancy can outperform a kernel with 100% occupancy if it has better instruction-level parallelism, less redundant work, or better memory behavior.**
 
-### Register 
+### Register Pressure 
 Describes the demand placed on the available register resources by a kernel's live values. 
 
 If many values must remain alive at the same time, the compiler needs more registers per thread. That increases register pressure. 
@@ -417,4 +417,62 @@ More resources consumed per thread can reduce the number of resident threads and
 Imagine the compiler wants to keep 100 values available for a thread, but the compiler or hardware allocation constraints make it unable to keep all those values in registers.
 
 It may place some values in local memory. This is called register spilling. register spilling can cause additional memory traffic and reduce performance.
+
+
+## Day 6: Memory Optimizations 
+### Vectorized Memory Access 
+We have studied that coalescing groups memory requests from multiple threads into one big transaction. **Vectorization** lets a single thread load or store multiple consecutive values in one wide operation. 
+
+**How cuda implements it**: 
+- a standard float is 32 bits(4 bytes). 
+- a float4 is a built-in CUDA type holding four consecutive float values: 128 bits (16 bytes). 
+- Instead of executing four separate 32-bit load instructions, the compiler generates one 128-bit load instruction. 
+
+![Vectorized Load/Store](./assets/day6/vectorized-loadstore.png)
+
+**Why it improves performance**: 
+1. Fewer Instructions: Cuts memory load/store instructions by up to 4x, freeing up the GPU's instruction scheduler.
+
+2. Lower Address Overhead: The GPU calculates one base memory address instead of four separate addresses
+
+3. Better Bandwidth Utilization: Moves larger chunks of data per clock cycle from Global Memory to registers.
+
+
+### Thread Coarsening 
+Each thread processes multiple data elements sequentially instead of a strict 1-to-1 mapping between threads and data elements. Instead of launching 1024 threads for 1024 elements (where thread `i` handles element `i`), you launch fewer threads (eg. 256) and have each thread run a small loop to process multiple elements (eg. 4 elements each). 
+
+**Standard 1:1 Mapping**: 
+
+```
+int i = blockIdx.x * blockDim.x + threadIdx.x;
+B[i] = A[i] * 2;
+```
+
+![Thread Coarsening](./assets/day6/thread-coarsening.png)
+
+**Coarsed Mapping**: 
+```cpp 
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+int unroll_factor = 4;
+int start_idx = tid * unroll_factor;
+
+#pragma unroll
+for (int j = 0; j < unroll_factor; j++) {
+    B[start_idx + j] = A[start_idx + j] * 2;
+}
+```
+
+**Why it improve performance**: 
+1. Reduced Thread Overhead: Cuts down the total number of threads managed by the GPU schedular, lowering control flow and indexing overhead. 
+
+2. Increased instruction-level parallelism(ILP): By loading multiple values inside the same thread, the compiler can overlap independent instructions and hide execution latency. 
+
+3. If the same element or neighboring elements are accessed mutliple times within the thread's local loop, they can stay in fast registers instead of being refetched from memory. 
+
+**But there is a tradeoff**: 
+Because a single threads handles multiple elements simulteneously. It needs more registers to store those intermediate values. If register usage exceeds the hardware limit, the GPU resorts to register spilling (writing data to slow local memory), which can severly hurt performance and reduce active warp occupancy. 
+
+
+### Shared Memory Tiling 
+Global memory is large but slow. Shared memory is small but extremely fast. In matmul, we often reuse the same input elements many times. Without tiling, threads repeatedly fetch the same data from slow Global Memory, causing bandwidth bottleneck. 
 
