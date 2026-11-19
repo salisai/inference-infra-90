@@ -473,6 +473,110 @@ for (int j = 0; j < unroll_factor; j++) {
 Because a single threads handles multiple elements simulteneously. It needs more registers to store those intermediate values. If register usage exceeds the hardware limit, the GPU resorts to register spilling (writing data to slow local memory), which can severly hurt performance and reduce active warp occupancy. 
 
 
-### Shared Memory Tiling 
-Global memory is large but slow. Shared memory is small but extremely fast. In matmul, we often reuse the same input elements many times. Without tiling, threads repeatedly fetch the same data from slow Global Memory, causing bandwidth bottleneck. 
+
+### Day 7: Tiled Matrix Multiplication 
+In day 3, we saw that naive matmul is severely memory-bound. Every element of the M and N matrces is read W times from slow HBM, giving an arithmatic intensity of just 0.25 FLOP/byte. 
+
+The core idea of tiling is, instead of computing an entire dot product directly from **global memory**, we break the matrices into smaller sub-matrices (tiles) of size **T x T** that fit into fast **on-chip shared memory**. 
+
+- Threads in a block cooperatively load one tile of M and one tile of N from global memory into shared memory. 
+
+- Every thread in that block then reuses those loaded values T times to compute a partial dot product before moving to the next pair of tiles. 
+
+**Working**: 
+
+First we need to see exactly how much memory bandwidth we waste in a standard, naive matmul. Let's look at the 2 x 2 quadrant of outpuer matrix P, computed by four threads: 
+- `thread(0,0)` for **P0,0**
+- `thread(0,1)` for **P0,1**
+- `thread(1,0)` for **P1,0**
+- `thread(1,1)` for **P1,1**
+
+![Naive Matmul](./assets/day7/matmul.png)
+
+Every thread in a naive setup runs its own loop, fetching eleemnts directly from slow Global Memory over and over, with zero coordinations: 
+
+In first iteration 
+- `thread(0,0)` fetches **M0,0** and **N0,0** to compute the first part of **P0,0** (in our tiled matmul phase 1, it is the 1).
+
+- `thread(0,1)` fetches the exact same **M0,0** and new **N0,1**. This means **M0,0** was fetched twice. 
+
+- `thread(1,0)` fetches **M1,0** and the exact same **N0,0** (M1,0 * N0,0). This means **N0,0** was fetched twice.
+
+- `thread(1,1)` fetches **M1,0** and the exact same **N0,1** (M1,0 * N0,1).
+![Access Order of Memory](./assets/day7/access-order.png)
+
+In a $4 \times 4$ matrix every single element of Matrix M and Matrix N is fetched 4 times by different threads. So what we are doing in naive kernel is: 
+
+Instead of loading an element into fast, on-chip SRAM once and sharing it, we load it and use it in a thread and throw it away, only for a neighboring thread to immediately ask Global Memory for that exact same piece of data. 
+
+With $4 \times 4$ matrices, the 16 threads make a staggering 128 global memory reads to compute 16 outputs, despite the inputs only having 32 total elements. This redundant memory traffic quickly saturates the GPU's memory bandwidth, leaving massive compute resources sitting idle while waiting on data.
+
+![Phase one of the tiled matmul](./assets/day7/phase1.png)
+![Phase 2 of the tiled matmul](./assets/day7/phase2.png)
+
+Do exactly same for the other quandrants or tileds of the output matrix. Go back to the naive matmul day and check the output values are same for both ways of matmul, the later one just efficient usage of memory. 
+
+### How efficient is Tiling: 
+- In a $4 \times 4$ matrix ($W=4$), the naive kernel uses 16 independent threads that each read an entire row of **M** (4 elements) and an entire column of **N** (4 elements) directly from Global Memory, resulting in **16 x (4+4) = 128** global reads. 
+
+- With **2 x 2** tiling (T=2), the output is divided into 4 thread blocks (4 threads per block) that execute across 4/2 = 2 phases; 
+  - in each phase, the entire 4 threads cooperatively load only one **2x2** tile of M (4 reads) and one **2x2** tile of N(4 reads) into shared memory and reuse each element T = 2 times locally. 
+  - meaning each block performs 2 phases x (4 + 4) = 16 global reads and all 4 blocks combined perform 4 x 16 = 64 reads. ($\frac{2W^3}{T} = \frac{2 \times 4^3}{2} = 64$, cuts traffic by factor of T = 2). 
+
+- Meanwhile global writes remain unchanged at $\mathbf{16}$ ($W^2$) in both approaches because each of the 16 threads still computes one final output element in its private register and writes it once to Global Memory P at the end. 
+
+![Naive vs Tiled Matmul](./assets/day7/naive-tiled.png)
+![Comparison of Naive vs Tiled Matmul](./assets/day7/comparison.png)
+
+### Tiled Matmul kernel 
+```cpp
+#define TILE_WIDTH 2
+
+__global__ void matMulKernel(float* M, float* N, float* P, int Width){ 
+    //Width: of the matrix, here 4
+
+    // one tile-worth of M and one tile-worth of N, 
+    // shared by every thread in the block(scope). 
+    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+
+    int bx = blockIdx.x; //block column position
+    int by = blockIdx.y; //block row position, 
+
+    //every thread in the same block has the same bx and by. 
+
+    int tx = threadIdx.x; //column position of thread within the block. 
+    int ty = threadIdx.y; //row position within the block. 
+
+    int Row = by * TILE_WIDTH + ty; // global row index of the thread
+    int Col = bx * TILE_WIDTH + tx; // global column index of the thread
+
+    float Pvalue = 0; 
+    //one iteration per tile. 
+    for (int ph = 0; ph < Width/TILE_WIDTH; ++ph){
+        
+        Mds[ty][tx] = M[Row*Width + ph*TILE_WIDTH + tx];
+        //Mds[1][0] = M[1*4 + 0*2 + 0] = M[4] = M1,0
+
+        Nds[ty][tx] = N[(ph*TILE_WIDTH + ty)*Width + Col];
+        //Nds[0][1] = N[(0*2 + 0)*4 + 1] = N[1] = N0,1
+
+        __syncthreads();
+        //read-after-write dependence(true dependence): threads must wait until 
+        // for data to be written to the proper place by other threads 
+        // before they try to read it. 
+
+        for (int k = 0; k < TILE_WIDTH; ++k) {
+            Pvalue += Mds[ty][k] * Nds[k][tx];
+        }
+        __syncthreads();
+        // write-after-read dependence(false dependence): thread 
+        // must wait for the data to be read by all threads that 
+        // need it before overwriting it. 
+    }
+
+    //global, the full complete value is writen here, not the half dot product value. 
+    P[Row*Width + Col] = Pvalue; 
+}
+```
 
