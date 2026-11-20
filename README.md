@@ -580,3 +580,94 @@ __global__ void matMulKernel(float* M, float* N, float* P, int Width){
 }
 ```
 
+
+## Day 8: Boundary Checks in Tiled MatMul
+In our matmuls, both naive and tiled, we assumed square matrices whose width is an exact multiple of `TILE_WIDTH`. In real workload, and especially when testing non-multiples like `Width=3` with `TILE_WIDTH=2`, two things happen: 
+
+- For `W=4 and TILE_WIDTH=2`phases are `4/2=2`. In `3x3` case, normal integer division truncates (`3/2=1`), which skips the final column/row in `3x3` matrix. To cover the tail elements, the phase count is `(Width + TILE_WIDTH - 1) / TILE_WIDTH` which gives 2 for this configuration. 
+
+- Launching enough `2x2` blocks to cover a `3x3` matrix creates a `4x4` thread grid, leaving extra threads at index `3`.  Guarding global reads with `0.0f` padding and guarding global writes prevents silent row-wraps, out-of-bounds memory reads, and invalid writes. 
+
+
+### How to Handle Boundary Checks Safely 
+Instead of skipping shared-memory writes (which would leave stale or garbage values inside `Mds` or `Nds` for `Pvalue += Mds[ty][k] * Nds[k][tx]`), every thread in the block still participates in the load step and writes 0.0f when its source coordinate is out of bounds. Adding 0.0f during the k loop leaves the partial dot product unchanged without reading invalid global memory.
+
+![Boundary Checks and edge case](./assets/day8/boundarycheck.png)
+
+We add three guards here: 
+1. Boundary check for M: valid row **(Row < Width)** and valid column **(mCol < Width)**.
+    ```cpp
+    if (Row < Width && mCol < Width){
+        Mds[ty][tx] = M[Row * Width + mCol];
+    } else {
+        Mds[ty][tx] = 0.0f; 
+    }
+    ```
+
+2. Boundary check for N: valid row **(mRow < Width)** and valid column **(Col < Width)**
+    ```cpp
+    if (nRow < Width && Col < Width){
+        Mds[ty][tx] = M[nRow * Width + Col];
+    } else {
+        Mds[ty][tx] = 0.0f; 
+    }
+    ```
+
+    ![Boundary Checks and edge case](./assets/day8/M-array.png)
+
+3. Boundary check for P: only valid output coordinates write back to global memory. 
+    ```cpp
+    if (Row < Width && Col < Width){
+        P[Row * Width + Col] = Pvalue; 
+    }
+    ```
+
+### The Kernel
+```cpp
+# define TILE_WIDTH 2 
+
+__global__ void matMulKernel(float* M, float* N, float* P, int Width){
+    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y; 
+    
+    int tx = threadIdx.x; 
+    int ty = threadIdx.y; 
+
+    float Pvalue = 0.0f; 
+
+    // ceiling division ensurs partial tiles
+    int numPhases = (Width + TILE_WIDTH - 1) / TILE_WIDTH; 
+
+    for (int ph = 0; ph < numPhases; ++ph){
+        int mCol = ph * TILE_WIDTH + tx; 
+        int mRow = ph * TILE_WIDTH + ty; 
+
+        if(Row < Width && mCol < Width){
+            Mds[ty][tx] = M[Row * Width + mCol];
+        } else {
+            Mds[ty][tx] = 0.0f; 
+        }
+
+        if(nRow < Width && Col < Width){
+            Nds[ty][tx] = N[nRow * Width + Col];
+        } else {
+            Nds[ty][tx] = 0.0f; 
+        }
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE_WIDTH; ++k){
+            Pvalue += Mds[ty][k] * Nds[k][tx]
+        }
+
+        __syncthreads();
+    }
+
+    if(Row < Width && Col < Width){
+        P[Row * Width + Col] = Pvalue; 
+    }
+}
+```
