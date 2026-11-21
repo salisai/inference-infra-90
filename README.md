@@ -671,3 +671,48 @@ __global__ void matMulKernel(float* M, float* N, float* P, int Width){
     }
 }
 ```
+
+## Day 9: Roofline and Arithmetic Intensity 
+- **FLOP(floating point operation)**: one math calculation like an addition or multiplication. FLOPs/s measures how fast the GPU can do math. 
+
+- **Memory bandwidth**: How fast data can travel between the GPU's main memory(HBM/GDDR) and the compute units, measured in bytes/second. 
+
+- **Arithmatic Intensity**: How much math you do per byte of data moved from global memory. 
+
+$$\text{Arithmetic Intensity} = \frac{\text{Total FLOPs}}{\text{Total Bytes Moved}}$$
+
+- If you fetch a heavy box of numbers and do lots of math on it before fetching the next one, arithmetic intensity is high. If you fetch numbers just to copy or add them once and put them back, arithmetic intensity is low.
+
+A GPU's maximum possible speed has two limits: 
+1. **Memory-bound**: Arihmetic intensity is low, which means little math is performed per byte. The compute cores sit waiting for data to arrive from memory. 
+
+2. **Compute-bound**: Arithmetic intensity is high (lots of math for every byte moved). Data arrives fast enough to keep the cores busy. 
+
+![Roofline Model](./assets/day9/roofline.png)
+
+### The Ridge point: 
+The Ridge Point is the exact turning point where the sloped memory-bandwidth line meets the flat compute ceiling. It tells you the minimum arithmetic intensity a workload needs to reach full compute speed.$$\text{Ridge Point (FLOPs/byte)} = \frac{\text{Peak Compute (FLOPs/s)}}{\text{Peak Memory Bandwidth (Bytes/s)}}$$
+
+**Using H100 80GB VRAM GPU**: 
+- Peak Memory Bandwidth (HBM3): $3.35\text{ TB/s} = 3.35 \times 10^{12}\text{ bytes/s}$
+- Peak Dense Compute (FP16 / BF16 Tensor Cores): $989\text{ TFLOPS} = 989 \times 10^{12}\text{ FLOPs/s}$
+
+
+$$\text{Ridge Point} = \frac{989 \times 10^{12}\text{ FLOPs/s}}{3.35 \times 10^{12}\text{ bytes/s}}$$
+
+$$\text{Ridge Point} = \frac{989}{3.35} \approx \mathbf{295.2\text{ FLOPs/byte}}$$
+
+
+### What this number means 
+- If Arithmetic Intensity $< 295.2\text{ FLOPs/byte}$: Your kernel is memory-bound. Its max achievable performance is limited by:
+$$\text{Attainable Performance} = \text{Arithmetic Intensity} \times 3.35\text{ TB/s}$$
+
+- If Arithmetic Intensity $> 295.2\text{ FLOPs/byte}$: Your kernel is compute-bound, capped near the GPU's compute ceiling (up to $989\text{ TFLOPS}$ for dense FP16/BF16).
+
+<br/>
+
+| Precision Mode | Peak Compute | Memory Bandwidth | Ridge Point |
+| :--- | :--- | :--- | :--- |
+| **FP16 / BF16 (Dense)** | $989\text{ TFLOPS}$ | $3.35\text{ TB/s}$ | $\approx 295.2\text{ FLOPs/byte}$ |
+| **FP8 (Dense)** | $1,979\text{ TFLOPS}$ | $3.35\text{ TB/s}$ | $\approx 590.7\text{ FLOPs/byte}$ |
+| **FP32 (CUDA Cores)** | $67\text{ TFLOPS}$ | $3.35\text{ TB/s}$ | $\approx 20.0\text{ FLOPs/byte}$ |
