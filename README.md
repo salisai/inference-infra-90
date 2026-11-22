@@ -716,3 +716,94 @@ $$\text{Attainable Performance} = \text{Arithmetic Intensity} \times 3.35\text{ 
 | **FP16 / BF16 (Dense)** | $989\text{ TFLOPS}$ | $3.35\text{ TB/s}$ | $\approx 295.2\text{ FLOPs/byte}$ |
 | **FP8 (Dense)** | $1,979\text{ TFLOPS}$ | $3.35\text{ TB/s}$ | $\approx 590.7\text{ FLOPs/byte}$ |
 | **FP32 (CUDA Cores)** | $67\text{ TFLOPS}$ | $3.35\text{ TB/s}$ | $\approx 20.0\text{ FLOPs/byte}$ |
+
+
+## Day 10: Reduction
+A reduction turns a list of values into one value with a binary operator: sum, max, min, product. It appears in LLM inference: softmax (max and sum per row), RMSNorm and LayerNorm(sum of squares, mean), argmax and top-k in sampling, vector norms. These operations are memory-bound: read the data once, do little math. 
+
+If we do these operations in sequential way, it takes N-1 steps, which is inefficient and extremely memory bound. 
+
+Parallel version: apply the operator to pairs at the same time, then to the results and so on. N values need `log2(N)` steps. 
+
+
+![Parallel tree in reduction](./assets/day10/parallel-tree.png)
+
+For example: `N = 1024`, 10 steps. Step 1 needs 512 threads, the last step needs 1. The hardware is under-used at the end of the tree. 
+
+- One thing to remember, operator must be associative (parenthesis can move). To also reorder the operands it must be commutative. Sum, Max, Min and Product are both. Subtraction is neither. 
+
+- Floating point addition is not exactly associative. A different tree gives a slightly different last digit. With atomics, the order changes from run to run, so the result can change between runs. This matters for reproducible inference.
+
+### Simple Kernel (divergent)
+Here thread t owns input[2t], the stride goes 1, 2, 4, 8,... Only threads with `threadIdx.x % stride == 0` work. 
+
+```cpp
+__global__ void simplesum(float* input, float* output){
+    
+    unsigned int i = 2 * threadIdx.x; 
+
+    for (unsigned int stride = 1; stride <= blockDim.x; stride *= 2){
+        if(threadIdx.x % stride == 0){
+            input[i] *= input[i + stride];
+        }
+
+        __syncthreads();
+    }
+
+    if(threadIdx.x ==0){
+        *output = input[0];
+    }
+}
+```
+
+- **Control divergence**: the active threads get farther apart each step. Iteration 1: half of every warp is idle. Iteration 6: only 1 of 32 threads in a warp works(31/32 wasted). For 256 elements the efficiency is 255/864 = 30%. 
+
+$$\text{Efficiency} = \frac{\text{Total Active Threads (Committed Operations)}}{\text{Total Execution Resources Consumed (Active Warps} \times 32\text{)}}$$
+
+- for an input size of N = 256: 
+    - threads launched: N/2 = 128 
+    - warps launched: 128/32 = 4 warps 
+    - total useful additions: N - 1 = 255
+
+- A GPU schedules warps in lockstep, if even 1 thread in a 32-thread warp is active, the hardware must execute the entire warp of 32 threads (wasting the other 31 slots)
+
+- **Memory divergence**: neighbouring threads access addresses 2 * stride apart, so global memory accesses are not coalesced, and every step reads and writes global memory.
+
+### Convergent kernel 
+We can improve the above simple kernel, by keeping the active threads together. The stride starts at blockDim and halves. Active threads are `threadIdx.x < stride`. Thread i owns `input[i]`.
+
+```cpp
+unsigned int i = threadIdx.x;
+
+for (unsigned int stride = blockDim.x; stride >= 1; stride /= 2) {
+    if (threadIdx.x < stride) {
+        input[i] += input[i + stride];
+    }
+
+    __syncthreads();
+}
+```
+![Control divergence](./assets/day10/divergence.png)
+
+Now in the second kernel active threads are consecutive, so a whole warp is either active or idle. No divergence until fewer than 32 threads are left(the last 5 iterations). Now efficiency for 256 elements: 255/384 = 66%. 
+
+Accesses are coalesced. 
+
+### Shared Memory 
+- The problem in the above kernel is that it writes partial sums to global memory and reads tham again for next iteration. We need to avoid this: each thread loads two elements from global memory, adds them and stores the sum in shared memory. All later steps use shared memory. 
+
+```cpp
+__shared__ float s[BLOCK_DIM];
+unsigned int t = threadIdx.x;
+
+s[t] = input[t] + input[t + BLOCK_DIM];   
+
+for (unsigned int stride = BLOCK_DIM / 2; stride >= 1; stride /= 2) {
+    __syncthreads();
+    if (t < stride) s[t] += s[t + stride];
+}
+```
+
+- Global accesses: N reads and 1 write, all coalesced. For 256 elements: 36 requests drop to 9. But the cost is one `__syncthreads()` per step.
+
+More will be shared on reduction and warp primitives tomorrow. 
