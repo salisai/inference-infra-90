@@ -1,9 +1,21 @@
 # Inference Engineering In 90 Days
+
 A hands-on, build-in-public journey through LLM inference and infrastructure: from how a single token is generated, to GPU kernels, to serving models at scale in production.
 
 **Note**: I'm writing it for my own revision and documentation purpose. Corrections and issues are welcome.
 
+We will cover in the following order: 
+1. GPUs and Kernel Foundations 
+2. Transformer Inference Mechanics 
+3. Serving Engine Internals 
+4. Optimizations 
+5. Multi-GPU and Large-Scale Serving 
+6. Production Infrastructure 
+
 <br/>
+
+# GPUs and Kernel Foundations  
+
 
 ## Day 1: GPU Arachitecture For Inference Engineers 
 
@@ -807,3 +819,119 @@ for (unsigned int stride = BLOCK_DIM / 2; stride >= 1; stride /= 2) {
 - Global accesses: N reads and 1 write, all coalesced. For 256 elements: 36 requests drop to 9. But the cost is one `__syncthreads()` per step.
 
 More will be shared on reduction and warp primitives tomorrow. 
+
+
+## Day 11: Warp Primitive and Reduction 
+Yesterday, we saw how parallel reduction works using a tree pattern. We fixed control divergence by keeping active threads packed together, and we used shared memory so threads didn't have to keep reading and writing slow global memory at every step.
+
+Even with shared memory, our Day 10 kernel still has one big annoyance: every single step in the loop needs `__syncthreads()`. Every time threads add two numbers in shared memory, the entire block has to stop and wait at a barrier before moving to the next step.
+
+Today we will try to optimize it further and remove the barriers. 
+
+### Warp-Level Primitives: 
+In our shared memory reduction tree, the number of active threads gets cut in half at every step (`stride` halves each iteration). Once `stride` reaches 32 and drops to 16, 8, 4, 2, 1, only one single warp, `warp 0`, is still doing any work. 
+
+When only one warp is left working: 
+- We don't need `__syncthreads()`: The 32 threads are already moving in lockstep. If we ever need a lightweight check inside a warp, CUDA provides `__syncwarp()`, which synchronizes just those 32 threads and brings diverged threads back together. 
+
+- We don't need shared memory: threads inside the same warp can read values straight out of each other's registers, which are faster than shared memory. 
+
+
+To pass data directly from one thread's register to another's, CUDA gives us warp shuffle instructions. For reduction, we use `__shfl_down_sync`. 
+
+```cpp
+T __shfl_down_sync(unsigned mask, T var, unsigned int delta);
+```
+
+Think of the 32 threads in a warp as 32 people standing in a line, numbered `0` though `31`(inside a warp this position is called **lane index** calculated as `threadIdx.x % 32)
+
+- `mask (0xffffffff)`: tells the GPU which lanes are participating. `0xffffffff` in hexadecimal is thiry-two `1s` in binary, meaning all 32 threads in a warp take part. 
+
+- `var`: the local variable sitting in each thread's register that it is offering to share. 
+- `delta`: how far down the line to reach. Thread `i` grabs `var` from thread `i + delta`(If i + delta goes past 31, thread i just gets its own value back.). 
+
+```cpp 
+__device__ __forceinline__ float warp_reduce_sum(float val){
+    for (int stride = 16; stride > 0; stride /= 2){
+        val += __shfl_down_sync(0xffffffff, val, stride);
+    }
+    return val; 
+}
+```
+
+Every thread technically returns a number, but only lane 0 holds the complete sum of all 32 threads. The other lanes only hold partial leftovers.
+
+CUDA also offers other warp primitives for different situaions: 
+- `__shfl_up_sync` and `__shfl_xor_sync` for different shuffle patterns
+- `__any_sync`, `__all_sync`, `__ballot_sync` to check conditions across a warp, and 
+- hardware-accelarated integer reductions like `__reduce_add_sync`
+
+
+### Cutting Out Almost ALL Shared Memory 
+A thread block (say, 1024 threads) is just a collection of 32 independent warps. Instead of making all 1024 threads talk to each other through shared memory at every step, we can split the block's work into two clean stages:
+
+1. Stage 1 (**every warp reduces itself**): each thread loads two elements from global memory and adds them in a register. Then, every warp in the block immediately runs `warp_reduce_sum` on its own 32 values. No shared memory. No barriers. At the end of stage 1, lane 0 of every warp holds that warps total sum. 
+
+2. The  Bride (One single barrier): Lane 0 of each warp (`threadIdx.x % 32 == 0`) writes its warp's partial sum into a tiny shared memory array (only 32 floats max, since a block has at most 1024/32 = warps). Then we call `__syncthreads()` once so all warps finish writing. 
+
+3. Stage 2 (Warp 0 finishes the job): Only warp 0 (`threadIdx.x < 32`) steps up. Its 32 threads load the 32 warp sums from shared memory (if the block had fewer than 32 warps—say, 256 threads = 8 warps—the extra lanes simply load `0.0f` so they don't affect the sum)
+
+```cpp
+__global__ void TwoStageReductionKernel(float* input, float* output){
+    unsigned int t = threadIdx.x; 
+
+    //load two values from global mem, and add them in a register 
+    float val = input[t] + input[t + blockDim.x]
+
+    //very warp reduces its 32 values using registers only, kernel from the above. 
+    val = warp_reduce_sum(val);
+
+    //lane 0 of each warp saves its warp sum to shared memory 
+    __shared__ float partial[32]; //max 32 warps in a 1024-thread block 
+
+    if(t % 32 == 0){
+        partial[t/32] = val; 
+    }
+
+    __syncthreads();
+
+    if (t < 32){
+        float warp_sum = (t < blockDim.x / 32) ? partial[t] : 0.0f;
+        warp_sum = warp_reduce_sum(warp_sum);
+
+        if(t == 0){
+            *output = warp_sum; 
+        }
+    }
+}
+```
+
+You might notice a trade-off here: during Stage 1, every warp runs 5 shuffle steps, and in the later steps of those shuffles, half the lanes inside each warp aren't doing useful work. In our older kernel, entire warps shut down early instead of running partially empty.
+
+So why does the two-stage kernel still win? Because once the data is loaded from global memory, reduction is latency-bound, not compute-bound. The GPU spends most of its time waiting on memory and synchronization barriers rather than doing math. Removing repeated shared memory trips and `__syncthreads()` barriers eliminates long-latency stalls, making the kernel noticeably faster in practice.
+
+
+### Making Each Thread Do More Upfront Work 
+A GPU only has a fixed number of SMs and can only run a certain number of thread blocks at the exact same time. If you have millions of elements and launch thousands of blocks, the GPU has to run them in waves—executing one batch of blocks, waiting for them to finish, and then running the next batch (serializing the extra blocks).
+
+Think about what happens inside every single block we launch:
+- In the very first step, 100% of the threads are busy adding two numbers.
+- In all the remaining steps of the reduction tree, half the threads drop out at each level. The hardware is mostly idle, yet it still has to step through the tree and pay for synchronization barriers.
+
+#### How To Implement 
+Instead of each thread adding just 2 elements before entering the reduction tree, we giv each thread a `COARSE_FACTOR` (say 2, or 4) so it adds `COARSE_FACTOR * 2` elements sequentially in a simple loop first: 
+
+```cpp
+unsigned int segment = COARSE_FACTOR * 2 * blockDim.x * blockIdx.x;
+unsigned int i = segment + threadIdx.x;
+
+float val = input[i];
+for (unsigned int c = 1; c < COARSE_FACTOR * 2; ++c) {
+    val += input[i + c * blockDim.x];
+}
+// Now pass 'val' into the two-stage warp reduction!
+```
+
+Suppose we have two blocks' worth of work. Without coarsening, the GPU runs two separate blocks—taking 8 total steps (only 2 steps with full thread utilization, and 6 under-utilized steps with barriers). With a coarsening factor of 2, one block handles all that work in 6 steps (3 steps at 100% utilization with zero barriers, and only 3 tree steps).
+
+Tomorrow we will try to study some simple GPU kernels which are very important in our LLM-inference journey. 
