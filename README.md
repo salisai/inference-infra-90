@@ -1042,3 +1042,60 @@ __global__ void relu_kernel(const float* input,
 Arithmetic Intensity & Bottleneck: With roughly 1 comparison-select ("1 FLOP") per 8 bytes moved:
 
 $$\text{Arithmetic Intensity} \approx \frac{1\text{ FLOP}}{8\text{ bytes}} = 0.125\text{ FLOP/byte}$$
+
+### Tanh 
+Tanh (Hyperbolic Tangent) maps input elements to the range $(-1, 1)$ over $N$ floats in device memory:
+
+$$\text{output}[i] = \tanh(\text{input}[i]), \quad i \in [0, N)$$
+
+Each thread calculates its global index:
+$$\text{idx} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+
+```cpp
+__global__ void tanh_kernel(const float* input, float* output, int N){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    if(idx < N){
+        //using the hardware intrinsic tanhf() for speed and stability
+        output[idx] = tanhf(input[idx])
+    }
+}
+```
+![Tanh](./assets/day12/tanh.png)
+
+
+Each element results in one 4-byte global load `(input[idx])` and one 4-byte global store `(output[idx])`, totaling 8 bytes/element ($8N$ bytes overall). Because consecutive threadIdx.x lanes access consecutive addresses, warps issue fully coalesced memory transactions. Intermediate calculation happens in registers—no shared memory is needed.
+
+with ~12 effective FLOPs (the cost of the `tanhf` SFU instruction) per 8 bytes moved. 
+
+$$\text{Arithmetic Intensity} \approx \frac{12\text{ FLOP}}{8\text{ bytes}} = 1.5\text{ FLOP/byte}$$
+
+
+### LeakyReLU 
+Leaky ReLU applies a piecewise linear function to $N$ floats in device memory, passing positive values and scaling negative values by a constant slope $\alpha$:
+
+$$\text{output}[i] = \begin{cases} \text{input}[i] & \text{if input}[i] > 0 \\ \alpha \cdot \text{input}[i] & \text{if input}[i] \le 0 \end{cases}, \quad i \in [0, N)$$
+
+
+Each thread calculates its unique global index: 
+
+$$\text{idx} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+
+```cpp
+__global__ void leaky_relu(const float* input, float* output, int N, float alpha){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (idx < N){
+        float x = input[idx]; 
+        output[idx] = (x > 0.0f) ? x : alpha * x; 
+    }
+}
+```
+
+Each element generates one 4-byte global load `(input[idx])` and one 4-byte global store `(output[idx])`, totaling 8 bytes/element ($8N$ bytes overall). Because consecutive threadIdx.x lanes access consecutive memory addresses, warps issue fully coalesced global memory transactions.
+
+The slope $\alpha$ is passed by value as a kernel argument. Every thread receives this single value, which resides in a register for the kernel's duration. This is highly efficient as it requires zero global memory access for the parameter itself.
+
+The kernel performs ~3 FLOPs (one compare, one select, one multiply) per 8 bytes moved:
+$$\text{Arithmetic Intensity} \approx \frac{3\text{ FLOP}}{8\text{ bytes}} = 0.375\text{ FLOP/byte}$$
+
+Writing the clamp as a ternary (x > 0 ? x : alpha * x) or if/else can be risky. However, for short conditionals, the compiler often generates predicated instructions rather than actual control-flow branches. This means every lane in the warp executes both sides of the operation, but only commits the result where the predicate is true, preventing warp serialization. The fmaxf intrinsic is generally incorrect for Leaky ReLU unless $\alpha$ is constrained between 0 and 1.
