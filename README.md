@@ -935,3 +935,110 @@ for (unsigned int c = 1; c < COARSE_FACTOR * 2; ++c) {
 Suppose we have two blocks' worth of work. Without coarsening, the GPU runs two separate blocks—taking 8 total steps (only 2 steps with full thread utilization, and 6 under-utilized steps with barriers). With a coarsening factor of 2, one block handles all that work in 6 steps (3 steps at 100% utilization with zero barriers, and only 3 tree steps).
 
 Tomorrow we will try to study some simple GPU kernels which are very important in our LLM-inference journey. 
+
+## Day 12: Some Basic Kernels 
+We had some basic kernel on vector addition, now we will start with matrix addition now. 
+
+### Matrix Addition 
+It computes a pointwise sum of two matrices, `C[i,j] = A[i,j] + B[i, j]`. Unlikely vector addition here the 2D coordinate must be flattened onto a row-major buffer.  
+
+![Matrix Addition](./assets/day12/mat-addition.png)
+
+In 2D coordinates we can use these two indexes for traversing the threads in the grid, having many blocks. 
+
+```
+j = blockIdx.x * blockDim.x + threadIdx.x; 
+```
+
+```
+i = blockIdx.y * blockDim.y + threadIdx.x; 
+```
+
+The offset of the specific thread in grid will be: 
+$$\text{offset} = i \times N + j$$
+
+Here N is the number of columns in the matrix and M the rows. 
+
+Always guard edge/overhang threads with `if(i < M && j < N>)` to avoid out-of-bounds reads/writes. 
+```cpp
+__global__ void matrixAddition(const float* A, const float* B, float* C, int M, int N){
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // along rows
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // along cols
+
+    if(i < M && j < M){
+        int idx = i * N + j; 
+        C[idx] = A[idx] + B[Idx];
+    }
+}
+```
+
+This kernel is deeply memory-bandwidth bound. For 4-byte floats, each output element takes `2 loads` + `1 store` = `3 * 4` = `12 bytes` and the operation is just 1(1 addition). 
+
+
+$$\text{Arithmetic Intensity} = \frac{1\text{ FLOP}}{12\text{ bytes}} \approx 0.083\text{ FLOP/byte}$$
+
+$$\text{Total Data Moved} \approx 12MN\text{ bytes}$$
+
+
+### Sigmoid 
+Sigmoid applies a pointwise non-linearity over $N$ floats in device memory (float = 4 bytes):$$\text{output}[i] = \frac{1}{1 + e^{-\text{input}[i]}}, \quad i \in [0, N)$$
+
+Each thread computes one global element index using a 1-D grid of 1-D blocks. 
+
+$$\text{idx} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+
+Because the grid rounds up to a multiple of 256, tail threads with idx >= N must be guarded. 
+
+
+
+![Sigmoid kernel](./assets/day12/sigmoid.png)
+
+
+```cpp
+__global__ void sigmoid_kernel(const float* input,
+                               float* output,
+                               int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+   
+   if (idx < N) {
+        float x = input[idx];
+        // expf() evaluates e^(-x) using hardware Special Function Units (SFUs)
+        output[idx] = 1.0f / (1.0f + expf(-x));
+    }
+}
+```
+
+Arithmetic Intensity & Bottleneck: expf runs on the GPU's Special Function Unit (SFU) across a few instructions, giving roughly ~12 effective FLOPs per element:
+
+$$\text{Arithmetic Intensity} \approx \frac{12\text{ FLOP}}{8\text{ bytes}} = 1.5\text{ FLOP/byte}$$
+
+
+**Latency Hiding & Overlap**: Global memory latency takes hundreds of cycles. The SM hides this by switching between resident warps while others wait on DRAM, and SFU expf work on active warps overlaps with memory traffic from other warps. There are no data-dependent branches, so there is no warp divergence.
+
+
+### ReLU 
+![ReLU activation function](./assets/day12/ReLU.png)
+
+ReLU clamps negative values to zero and passes positive values straight through over $N$ floats in device memory:
+
+$$\text{output}[i] = \max(\text{input}[i], 0), \quad i \in [0, N)$$
+
+Using the same way: 
+$$\text{idx} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+
+```cpp
+__global__ void relu_kernel(const float* input,
+                            float* output,
+                            int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        // branchless clamp: avoids SIMT warp divergence
+        output[idx] = fmaxf(input[idx], 0.0f);
+    }
+}
+```
+
+
+Arithmetic Intensity & Bottleneck: With roughly 1 comparison-select ("1 FLOP") per 8 bytes moved:
+
+$$\text{Arithmetic Intensity} \approx \frac{1\text{ FLOP}}{8\text{ bytes}} = 0.125\text{ FLOP/byte}$$
