@@ -1,4 +1,4 @@
-# Inference Engineering In 90 Days
+# Inference Engineering
 
 A hands-on, build-in-public journey through LLM inference and infrastructure: from how a single token is generated, to GPU kernels, to serving models at scale in production.
 
@@ -1093,9 +1093,112 @@ __global__ void leaky_relu(const float* input, float* output, int N, float alpha
 
 Each element generates one 4-byte global load `(input[idx])` and one 4-byte global store `(output[idx])`, totaling 8 bytes/element ($8N$ bytes overall). Because consecutive threadIdx.x lanes access consecutive memory addresses, warps issue fully coalesced global memory transactions.
 
+![Leaky ReLU](./assets/day12/LeakyReLU.png)
+
+
 The slope $\alpha$ is passed by value as a kernel argument. Every thread receives this single value, which resides in a register for the kernel's duration. This is highly efficient as it requires zero global memory access for the parameter itself.
 
 The kernel performs ~3 FLOPs (one compare, one select, one multiply) per 8 bytes moved:
 $$\text{Arithmetic Intensity} \approx \frac{3\text{ FLOP}}{8\text{ bytes}} = 0.375\text{ FLOP/byte}$$
 
 Writing the clamp as a ternary (x > 0 ? x : alpha * x) or if/else can be risky. However, for short conditionals, the compiler often generates predicated instructions rather than actual control-flow branches. This means every lane in the warp executes both sides of the operation, but only commits the result where the predicate is true, preventing warp serialization. The fmaxf intrinsic is generally incorrect for Leaky ReLU unless $\alpha$ is constrained between 0 and 1.
+
+
+## Day 13: Softmax Kernel 
+Unlike elementwise maps, that we did in the previous day's kernels, **softmaax** is a row-parallel normalization: no single output can be finalized until the entire row's maximum and sum of shifted exponentials are known. 
+
+In math textbooks, Softmax is written directly over raw scores $x_i = \text{input}[i]$:$$\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_{j=0}^{N-1} e^{x_j}}$$
+
+Multiplying the numerator and denominator of the textbook formula by  $e^{-m}$ leaves the fraction unchanged:
+
+$$\frac{e^{-m} \cdot e^{x_i}}{e^{-m} \cdot \sum_{j=0}^{N-1} e^{x_j}} = \frac{e^{x_i - m}}{\sum_{j=0}^{N-1} e^{x_j - m}}$$
+
+Where $m = \max_{j} x_j$, the maximum of the row.
+
+Withtout subtracting **m**, large logits can cause $\exp(\text{input}[j])$ to overflow `float32` to `inf`, producing `NaN` in the division. Subtracting **m** shifts the largest value to $\exp(0) = 1.0$. 
+
+**m** depends on the whole array, you cannot compute $\exp(\text{input}[i] - m)$ until the max pass finishes, and you can't write $\text{output}[i]$ until the sum pass finishes.
+
+![Softmax](./assets/day13/softmax.png)
+
+### Coopeartive Block Reduction Strategy 
+For a 1-D vector of length $N$, a standard pattern is to assign a single thread block to own the entire row. Because the block size (e.g., 256 threads) is typically much smaller than the row length $N$, threads cooperate to reduce the row.
+
+This process proceeds in distinct, multi-pass stages, where synchronization is essential.
+
+### 1. Local Sweep and Shared Memory Write 
+Collapse the large input vector into smaller partial results that fit into shared memory. Each thread in the block does not process just one element. Instead, it processes multiple elements in a loop, striding by the block's size: `idx = tid; idx < N; idx += blockDim.x`. 
+
+As the thread iterates through its slice, it maintains a local running result (e.g., a local maximum). After finishing its entire slice, each thread writes its single, final partial result to a specific index in a __shared__ memory array.
+
+### 2. Shared Memory Tree Reduction 
+Combine the partial results (now in the shared memory) into a single value for the block. The block performs a parallel tree reduction (or "butterfly" reduction) in shared memory. This collapses the partials in $\log_2(\text{blockDim.x})$ steps rather than a linear scan.
+
+In each step, the number of active threads halves. The stride between threads being combined also halves, starting at `blockDim.x / 2` and reducing down to 1
+
+You must place a __syncthreads() barrier at every pass boundary.
+
+### Worked Walkthrough: `input = [1, 3, 2, 5], N = 4`
+- Max Pass: Tree Reduction folds `[1, 3, 2, 5]` in $\log_2 4 = 2$ steps $\rightarrow$ [2, 5] $\rightarrow$ m = 5. Here stride is 2, therefore we pair third element with first. 
+
+- Each thread computes $\exp(\text{input}[i] - 5) \approx [0.018, 0.135, 0.050, 1.0]$, which tree-reduces to sum ≈ 1.203
+
+- Write pass: Each thread divides its shifted exponential by 1.203, yielding $\approx [0.015, 0.112, 0.041, 0.832]$ (summing to 1.0).
+
+```cpp
+__global__ void softmax_kernel(const float* input, float* output, int N){
+    extern __shared__ float sdata[]; //dynamically sized shared-mem array 
+    int tid = threadIdx.x; 
+    int block_size = blockDim.x; 
+
+    // local max over strided elements 
+    float local_max = -FLT_MAX; 
+    for (int i = tid; i < N; i += block_size){
+        local_max = fmaxf(local_max, input[i]);
+    }
+
+    //write each thread's local maximum into its slot in shared memory.
+    sdata[tid] = local_max; 
+    __syncthreads()
+
+    // tree reduction for block max 
+    for (int stride = block_size/2; stride > 0; stride >>=1){
+        if(tid < stride){
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    float row_max = sdata[0];
+    __syncthreads();
+
+    // local sum of exp(x - row_max)
+    float local_sum = 0.0f; 
+    for (int i = tid; i < N; i += block_size){
+        local_sum += expf(input[i] - row_max);
+    }
+    sdata[tid] = local_sum; 
+    __syncthreads();
+
+
+    // tree reduction for block sum 
+    for(int stride = block_size / 2; stride > 0; stride >>= 1){
+        if(tid < stride){
+            sdata[tid] += sdata[tid + stride];
+        }
+        
+        __syncthreads();
+    }
+
+    float row_sum = sdata[0];
+    __syncthreads();
+
+
+    // normalize and write output
+    for (int i = tid; i < N; i += block_size) {
+        output[i] = expf(input[i] - row_max) / row_sum;
+    }
+}
+```
+
+At roughly $\sim 5\text{ FLOPs}$ per $8\text{ bytes}$ moved ($\sim 0.6\text{ FLOP/byte}$), Softmax sits well below modern GPU roofline ridge points—so it is memory-bandwidth bound at scale.
