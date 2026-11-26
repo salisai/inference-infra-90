@@ -1202,3 +1202,32 @@ __global__ void softmax_kernel(const float* input, float* output, int N){
 ```
 
 At roughly $\sim 5\text{ FLOPs}$ per $8\text{ bytes}$ moved ($\sim 0.6\text{ FLOP/byte}$), Softmax sits well below modern GPU roofline ridge points—so it is memory-bandwidth bound at scale.
+
+
+## Day 14: How Computer Store Numbers 
+Computers use two fundamentally different ways to represent numbers: Integers (whole numbers) and Floating-Point (numbers with decimals).
+
+### Integers(INT)
+An integer uses all its bits to count whole steps, like ticks on a ruler.
+- Super fast math, tiny memory footprint. 
+- but cannot represent decimals (eg. 0.456), and has a strict maximum limit. If a number exceeds that limit, it breaks(overflow). 
+
+![INT representation](./assets/day14/int.png)
+
+
+### Floating-Point(FP)
+To store both tiny decimals and massive numbers, computers use scientific notation: 
+$$\text{Value} = (-1)^{\text{Sign}} \times 2^{\text{Exponent}} \times (1 + \text{Mantissa})$$
+
+
+![Values](./assets/day14/Values.png)
+
+Because you have a fixed number of bits (e.g., 16 bits), giving more bits to the Exponent gives you a wider Range (less chance of crashing during training), while giving more bits to the Mantissa gives you higher Precision (less rounding error).
+
+
+![Floats](./assets/day14/list.png)
+
+Modern LLM systems also rely on microscaling and block-quantized formats like **NVFP4**, **MXFP4**, **MXFP6**, and **MXFP8**—which pair tiny 4-bit to 8-bit elements with shared block scale factors to protect reasoning accuracy and shrink VRAM for large models. We will study how those work later in this journey.
+
+### Comparison table 
+![Floats](./assets/day14/comparison.png)
