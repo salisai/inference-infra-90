@@ -1231,3 +1231,91 @@ Modern LLM systems also rely on microscaling and block-quantized formats like **
 
 ### Comparison table 
 ![Floats](./assets/day14/comparison.png)
+
+## Day 15: GEMM 
+
+### GEMM Basics 
+General Matrix Multiplication (GEMM) is the core operation for neural network linear layers. It is mathematically defined as:
+$$C = \alpha(A \times B) + \beta C$$
+
+-  $A$, left input matrix, has shape $(M, K)$
+- $B$, right input matrix, has shape $(K, N)$
+- $C$, the accumalator has shape $(M, N)$
+
+![General MatMul](./assets/day15/GEMM.png)
+
+
+Computes matrix product $A \times B$, scales it by $\alpha$, and adds existing matrix $C$ scaled by $\beta$, all in one kernel call without extra memory round-trips
+
+- $\alpha$ (Alpha) is a scaling factor, applied to the raw product $(A \times B)$. It is typically set to 1.0, but can be used to scale activation or gradient updates during backpropagation.
+
+- $\beta$ (Beta) & $+ C$ controls how the result is combined with the pre-existing values in the target buffer $C$.
+
+    - $\beta = 0$ (Overwrite): Composed as $C = \alpha(A \times B)$. It bypasses reading the old memory of $C$ entirely, overwriting it cleanly with the new results. Good for forward passes where the output doesn't accumulate.
+
+    - $\beta = 1$ (Accumulation): Composed as $C = \alpha(A \times B) + C$. Accumulates the scaled result into the existing $C$ matrix in-place. Crucial for combining bias additions, residual connections (like skip connections in Transformers), or summing partial block updates without needing a separate extra memory copy step.
+
+    - Other $\beta$ values: Scale the old buffer before adding (used in momentum, weighted averaging, and blending updates).
+
+A standard matrix multiplication (like PyTorch’s A @ B or torch.matmul) defaults to $\alpha = 1.0$ and $\beta = 0.0$.
+
+---
+
+### FLOP Count and Arithmetic Intensity 
+Each of the $M \times N$ elements in output matrix $C$ is a dot product of length $K$ ($K$ multiply-add pairs). Treating 1 multiply + 1 add as 2 FLOPs gives, for $M \times N$ elements :
+
+$$C_{i,j} = \sum_{p=1}^{K} A_{i,p} \cdot B_{p,j}$$
+
+- There are $K$ terms in this sum ($p = 1, 2, \dots, K$).
+- Each term does 1 multiplication ($A_{i,p} \cdot B_{p,j}$) and 1 addition (adding it to the running sum).
+- That is $2 \times K$ FLOPs for just one element of $C$.
+
+So it will become: 
+
+$$\text{FLOPs} = (M \times N) \times (2 \times K) = 2 \times M \times N \times K$$
+
+$$\text{Bytes}_{\text{HBM}} \approx s_A M K + s_B K N + s_C M N$$
+
+And: 
+
+$$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes transferred from HBM}}$$
+
+So it becomes: 
+$$I_{A \times B} \approx \frac{2MNK}{s_A M K + s_B K N + s_C M N}$$
+
+Here $s_A, s_B, s_C$ be the byte sizes per element of $A$, $B$, and $C$ (for example, $2$ bytes for FP16/BF16, $4$ bytes for FP32, $1$ byte for FP8/INT8).
+
+
+--- 
+
+### When $\alpha$, $\beta$, and $+ C$ are included? 
+The definition is the same ($\text{FLOPs} / \text{Bytes transferred from HBM}$), but the exact numerator and denominator shift slightly once $\alpha$, $\beta$, and $+ C$ are included.
+
+### 1. FLOPs
+- Matrix product ($A \times B$): $2MNK$ FLOPs.
+- Scaling & accumulation ($\alpha$, $\beta$, $+ C$): Scaling by $\alpha$, scaling old $C$ by $\beta$, and adding them adds at most $O(MN)$ elementwise FLOPs (e.g., $2MN$ or $3MN$ FLOPs).
+- For large matrices, $2MNK \gg O(MN)$, so $2MNK$ is still the dominant FLOP count, though strictly speaking, the extra $O(MN)$ ops exist, so:
+
+<br/>
+
+
+$$\text{FLOPs} \approx 2MNK + O(MN)$$
+
+### 2. Bytes Transferred from HBM 
+This is where $\beta$ and $+ C$ actually make a noticeable difference, especially when $M$ and $N$ are large or when $K$ is small:
+
+- If $\beta \neq 0$ (e.g., $\beta = 1$): you must read existing $C$ from HBM and write the updated $C$ back to HBM, adding $\approx 2 \cdot \text{sizeof}(C) \cdot MN$ bytes of traffic for buffer $C$ instead of $1 \times$ write.
+
+$$\text{Bytes} \approx \text{sizeof}(A)\cdot MK + \text{sizeof}(B)\cdot KN + 2 \cdot \text{sizeof}(C)\cdot MN$$
+
+$$\text{Bytes}_{\text{HBM}} \approx s_A M K + s_B K N + 2 s_C M N$$
+
+### 3. Arithmetic Intensity 
+$$I_{\beta \neq 0} \approx \frac{2MNK + O(MN)}{s_A M K + s_B K N + 2 s_C M N}$$
+
+---
+
+### Conclusion 
+Large $K$ / large square shapes: The extra $C$ read/write and scalar math are small relative to $A$, $B$, and $2MNK$, so arithmetic intensity is essentially unchanged.
+
+Small $K$ or large output $M \times N$ with $\beta \neq 0$: Reading old $C$ increases HBM byte traffic, which slightly lowers arithmetic intensity compared to $\beta = 0$ (and if $\beta = 0$ is explicitly passed to cuBLAS, it avoids that extra read altogether).
