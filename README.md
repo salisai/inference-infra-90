@@ -1281,6 +1281,7 @@ And:
 $$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes transferred from HBM}}$$
 
 So it becomes: 
+
 $$I_{A \times B} \approx \frac{2MNK}{s_A M K + s_B K N + s_C M N}$$
 
 Here $s_A, s_B, s_C$ be the byte sizes per element of $A$, $B$, and $C$ (for example, $2$ bytes for FP16/BF16, $4$ bytes for FP32, $1$ byte for FP8/INT8).
@@ -1319,3 +1320,35 @@ $$I_{\beta \neq 0} \approx \frac{2MNK + O(MN)}{s_A M K + s_B K N + 2 s_C M N}$$
 Large $K$ / large square shapes: The extra $C$ read/write and scalar math are small relative to $A$, $B$, and $2MNK$, so arithmetic intensity is essentially unchanged.
 
 Small $K$ or large output $M \times N$ with $\beta \neq 0$: Reading old $C$ increases HBM byte traffic, which slightly lowers arithmetic intensity compared to $\beta = 0$ (and if $\beta = 0$ is explicitly passed to cuBLAS, it avoids that extra read altogether).
+
+
+## Day 16: Tensor Cores 
+Think of a standard CUDA core as a single worker handling one scalar fused multiply-add (FMA) per clock cycle:
+
+$$d = a \times b + c$$
+
+One thread does one tiny scalar calculation at a time. 
+
+A **Tensor Core** is a specialized matrix engine built right inside each Streaming Multiprocessor (SM). Instead of one thread multiplying two single numbers, an entire 32-thread warp teams up on a single Tensor Core instruction to compute a whole mini-matrix block in 1–2 cycles.
+
+$$D_{M \times N} = A_{M \times K} \times B_{K \times N} + C_{M \times N}$$
+
+![Tensor Cores and Cuda cores](./assets/day16/mma.png)
+
+Moving big numbers around memory is slow and expensive. Tensor Cores speed things up using mixed precision:
+
+- **Inputs ($A, B$)** in lower precision: Formats like FP16, BF16, TF32, FP8, or INT8 take fewer bits per value. Smaller values mean lower memory traffic, more data fitting in caches, and much higher math throughput per cycle.
+
+- **Accumulation ($C, D$)** in higher precision: While multiplying across a long inner dimension $K$, adding lots of small numbers in low precision can cause rounding errors, underflow, or catastrophic cancellation. So the running sum is accumulated in FP32 (or INT32 for integer math) inside the Tensor Core pipeline, and only downcast to narrower precision when written out if needed.
+
+
+### Tensor Core Instruction Evolution
+
+Tensor Core instructions have scaled from small synchronous warp tiles to wide asynchronous/cooperative tiles backed by faster memory staging:
+
+* **Volta / Turing (`HMMA` / `WMMA`):** Synchronous warp-level MMA (32 threads) on small logical tiles (e.g., $16 \times 16 \times 16$).
+* **Ampere (`mma.sync`):** Adds **TF32** (FP32 exponent range, fewer mantissa bits) and **2:4 structured sparsity** (2 zeros per 4 elements to skip half the math).
+* **Hopper (`WGMMA`):** Moves to **warpgroup** MMA (128 threads / 4 warps) reading **asynchronously from Shared Memory (`SMEM`)** rather than staging through registers first, scaling tiles up to $64 \times 256 \times 16$.
+* **Blackwell (`tcgen05`):** Adds **2-SM cooperative** MMA backed by dedicated **Tensor Memory (`TMEM`)**, scaling tiles up to $256 \times 256 \times 16$.
+
+![Evolution of Tensor Cores](./assets/day16/evolution.png)
